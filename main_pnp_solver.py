@@ -383,11 +383,11 @@ class HeatmapAnnotator:
         if n_done < self.n_points:
             next_lm = self.target_landmarks[n_done]
             guide_text = (
-                f"[{n_done + 1}/{self.n_points}] クリック: {next_lm['name']}"
+                f"[{n_done + 1}/{self.n_points}] Click: {next_lm['name']}"
             )
             guide_color = (0, 200, 255)
         else:
-            guide_text = "全点完了！ [s] で保存 / [r] でリセット"
+            guide_text = "All points annotated! [s] Save / [r] Reset"
             guide_color = (0, 255, 128)
 
         # 上部情報帯
