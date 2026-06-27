@@ -1,0 +1,25 @@
+{
+  "paths": {
+    "sync_log": "input/sync_log.csv",
+    "sync_params": "input/sync_params.json",
+    "events": "input/events.csv",
+    "landmark": "input/landmark.csv",
+    "calibration": "input/calibration.json",
+    "output_transform": "output/transform_matrix.json",
+    "output_points": "output/annotated_points.json"
+  },
+  "event_frame": {
+    "width": 320,
+    "height": 320,
+    "integration_time_ms": 16.0
+  },
+  "target_landmarks": [
+    {"id": 308, "name": "口の左端"},
+    {"id": 78,  "name": "口の右端"},
+    {"id": 133, "name": "右目の目頭"},
+    {"id": 33,  "name": "右目の目尻"},
+    {"id": 362, "name": "左目の目頭"},
+    {"id": 263, "name": "左目の目尻"},
+    {"id": 4,   "name": "鼻頭"}
+  ]
+}
