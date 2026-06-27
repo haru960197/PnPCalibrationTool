@@ -58,31 +58,33 @@ def generate_sync_params() -> dict:
     return params
 
 
-def generate_events(n_frames: int = 30, fps: float = 30.0, events_per_frame: int = 500) -> None:
+def generate_events(total_duration_us: float = 15_000_000, events_per_ms: int = 20) -> None:
     """
     events.csv を生成する（ランダムなイベントデータ）。
 
+    config.json の start_delay_us=7,000,000 µs + accumulation_time_us=5,000,000 µs に
+    対応するため、0 ～ total_duration_us の範囲でイベントを生成する。
+    ヒートマップ積算対象となる 7,000,000 ～ 12,000,000 µs の範囲に
+    十分なイベントが含まれるようにする。
+
     Parameters
     ----------
-    n_frames : int
-        フレーム数（このフレーム数分のイベントを生成）
-    fps : float
-        フレームレート [fps]
-    events_per_frame : int
-        フレームあたりのイベント数
+    total_duration_us : float
+        生成するイベント全体の時間幅 [µs]（デフォルト: 15 秒）
+    events_per_ms : int
+        1ms あたりの平均イベント数
     """
-    # A=0.001, B=0 なので t_event = t_rgb / A = t_rgb / 0.001
-    # 例: t_rgb=0ms → t_event=0µs, t_rgb=33ms → t_event=33000µs
+    rng = random.Random(42)
     all_rows = []
-    for i in range(n_frames):
-        t_center_ms = i * (1000.0 / fps)
-        t_center_us = t_center_ms / 0.001  # µs 変換 (A=0.001)
-        for _ in range(events_per_frame):
-            x = random.randint(0, 319)
-            y = random.randint(0, 319)
-            pol = random.choice([0, 1])
-            # フレーム中心 ±8000µs の範囲でランダム
-            t = t_center_us + random.uniform(-8000, 8000)
+
+    total_ms = int(total_duration_us / 1000)
+    for ms_idx in range(total_ms):
+        t_center_us = ms_idx * 1000.0
+        for _ in range(events_per_ms):
+            x = rng.randint(0, 319)
+            y = rng.randint(0, 319)
+            pol = rng.choice([0, 1])
+            t = t_center_us + rng.uniform(0, 1000)
             all_rows.append((x, y, pol, t))
 
     # timestamp でソート
@@ -90,7 +92,7 @@ def generate_events(n_frames: int = 30, fps: float = 30.0, events_per_frame: int
 
     df = pd.DataFrame(all_rows, columns=["x", "y", "polarity", "timestamp"])
     df.to_csv(OUTPUT_DIR / "events.csv", index=False)
-    print(f"[生成] {OUTPUT_DIR / 'events.csv'} ({len(all_rows)} イベント)")
+    print(f"[生成] {OUTPUT_DIR / 'events.csv'} ({len(all_rows)} イベント, {total_duration_us/1e6:.1f} 秒分)")
 
 
 def generate_landmark(n_frames: int = 30, n_landmarks: int = 478) -> None:
@@ -155,9 +157,10 @@ if __name__ == "__main__":
     print("=== ダミーデータ生成 ===")
     generate_sync_log()
     generate_sync_params()
+    print("[注意] events.csv は 15 秒分（約 300,000 イベント）を生成します。少々お待ちください...")
     generate_events()
     generate_landmark()
     generate_calibration()
     print("\n完了! input/ ディレクトリにファイルを生成しました。")
     print("次のコマンドでメインツールを起動できます:")
-    print("  python main_pnp_solver.py --config config.json --frame 0")
+    print("  python main_pnp_solver.py --config config.json")

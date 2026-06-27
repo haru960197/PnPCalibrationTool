@@ -8,39 +8,24 @@
     "output_transform": "output/transform_matrix.json",
     "output_points": "output/annotated_points.json"
   },
+  "rgb_frame": {
+    "calibration_frame_index": 10
+  },
   "event_frame": {
     "width": 320,
     "height": 320,
-    "integration_time_ms": 16.0
+    "integration_time_ms": 16.0,
+    "accumulation_time_us": 5000000,
+    "start_delay_us": 7000000,
+    "clip_percentile": 99.5
   },
   "target_landmarks": [
-    {
-      "id": 308,
-      "name": "Left of mouth"
-    },
-    {
-      "id": 78,
-      "name": "Right of mouth"
-    },
-    {
-      "id": 133,
-      "name": "Right of eye: center"
-    },
-    {
-      "id": 33,
-      "name": "Right of eye: end"
-    },
-    {
-      "id": 362,
-      "name": "Left of eye: center"
-    },
-    {
-      "id": 263,
-      "name": "Left of eye: end"
-    },
-    {
-      "id": 4,
-      "name": "Nose tip"
-    }
+    {"id": 308, "name": "口の左端"},
+    {"id": 78,  "name": "口の右端"},
+    {"id": 133, "name": "右目の目頭"},
+    {"id": 33,  "name": "右目の目尻"},
+    {"id": 362, "name": "左目の目頭"},
+    {"id": 263, "name": "左目の目尻"},
+    {"id": 4,   "name": "鼻頭"}
   ]
 }

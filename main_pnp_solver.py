@@ -3,21 +3,22 @@ main_pnp_solver.py
 ------------------
 PnP（Perspective-n-Point）問題を解くメインツール。
 
-処理フロー:
-  Step 1 : sync_log.csv と sync_params.json を使ってイベントフレームを生成
-  Step 2 : OpenCV GUI でユーザーが 7 点のランドマークを手動アノテーション
-  Step 3 : landmark.csv から対応する 3D 座標を取得し cv2.solvePnP を実行
-  Step 4 : rvec / tvec を JSON に保存
+【新アノテーションフロー】
+  Step 1 : events.csv の絶対時刻範囲（start_delay_us ～ +accumulation_time_us）を
+           空間積算したヒートマップ画像を生成する。
+           （sync_params による厳密な時刻同期は使用しない）
+  Step 2 : OpenCV GUI でヒートマップ上にランドマーク 7 点をマウスクリックでアノテーション。
+  Step 3 : config.json の calibration_frame_index で指定した RGB フレームの
+           landmark.csv から 3D 座標を取得して 2D/3D ペアを構成する。
+  Step 4 : cv2.solvePnP で rvec / tvec を求解し、JSON に保存する。
 
 使い方:
-  python main_pnp_solver.py [--config CONFIG] [--frame FRAME_INDEX]
+  python main_pnp_solver.py [--config CONFIG]
 
 キーボード操作 (GUI):
-  n / →  : 次のフレームへ
-  p / ←  : 前のフレームへ
   u      : 直前のクリックを取り消す（Undo）
-  r      : 現フレームのアノテーションをリセット
-  s      : 現フレームで PnP を計算して保存
+  r      : アノテーションをリセット
+  s      : PnP を計算して保存
   q / Esc: 終了
 """
 
@@ -31,25 +32,29 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from event_loader import build_event_frame, load_events_in_range
+from event_loader import (
+    build_event_heatmap,
+    heatmap_to_bgr,
+    normalize_to_uint8,
+)
 
 
 # ---------------------------------------------------------------------------
 # 定数
 # ---------------------------------------------------------------------------
-WINDOW_NAME = "PnP Solver - Event Frame Annotation"
-CLICK_RADIUS = 6          # クリック点を描画する円の半径 [pixels]
-CLICK_COLOR_DONE = (0, 255, 0)    # 記録済み点の色 (BGR)
-CLICK_COLOR_CURRENT = (0, 165, 255)  # 現在ターゲット点の色 (BGR)
+WINDOW_NAME = "PnP Solver - Heatmap Annotation"
+CLICK_RADIUS = 6
+CLICK_COLOR_DONE = (0, 255, 0)       # 記録済み点の色 (BGR: 緑)
 TEXT_COLOR = (255, 255, 255)
 TEXT_BG_COLOR = (30, 30, 30)
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-DISPLAY_SCALE = 2          # 表示倍率（小さい画像を見やすくするため）
+DISPLAY_SCALE = 2                    # 320px → 640px 表示
 
 
 # ---------------------------------------------------------------------------
-# ユーティリティ関数
+# データ読み込みユーティリティ
 # ---------------------------------------------------------------------------
+
 def load_config(config_path: str) -> Dict:
     """
     config.json を読み込んで辞書として返す。
@@ -68,46 +73,6 @@ def load_config(config_path: str) -> Dict:
         return json.load(f)
 
 
-def load_sync_log(path: str) -> pd.DataFrame:
-    """
-    sync_log.csv を読み込む。
-
-    カラム: frame_index, timestamp_ms, led_status
-
-    Parameters
-    ----------
-    path : str
-        sync_log.csv のパス
-
-    Returns
-    -------
-    pd.DataFrame
-    """
-    df = pd.read_csv(path, dtype={"frame_index": int, "timestamp_ms": float})
-    return df.set_index("frame_index")
-
-
-def load_sync_params(path: str) -> Tuple[float, float]:
-    """
-    sync_params.json を読み込み (A, B) を返す。
-
-    関係式: t_rgb [ms] = A * t_event [µs] + B
-
-    Parameters
-    ----------
-    path : str
-        sync_params.json のパス
-
-    Returns
-    -------
-    Tuple[float, float]
-        (A, B)
-    """
-    with open(path, "r") as f:
-        params = json.load(f)
-    return float(params["A"]), float(params["B"])
-
-
 def load_calibration(path: str) -> Tuple[np.ndarray, np.ndarray]:
     """
     calibration.json を読み込み、カメラ行列と歪み係数を返す。
@@ -120,9 +85,9 @@ def load_calibration(path: str) -> Tuple[np.ndarray, np.ndarray]:
     Returns
     -------
     Tuple[np.ndarray, np.ndarray]
-        (camera_matrix [3x3], dist_coeffs [5,])
+        (camera_matrix [3x3], dist_coeffs [5x1])
     """
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         cal = json.load(f)
     camera_matrix = np.array(cal["intrinsics"], dtype=np.float64)
     dist_coeffs = np.array(cal["distortion"], dtype=np.float64).reshape(-1, 1)
@@ -158,83 +123,6 @@ def load_landmark_csv(path: str) -> pd.DataFrame:
     return df
 
 
-def rgb_timestamp_to_event_timestamp(
-    timestamp_ms: float, A: float, B: float
-) -> float:
-    """
-    RGB カメラのタイムスタンプ [ms] をイベントカメラのタイムスタンプ [µs] へ変換する。
-
-    変換式 (逆算): t_event = (t_rgb - B) / A
-
-    Parameters
-    ----------
-    timestamp_ms : float
-        RGB カメラのタイムスタンプ [ms]
-    A : float
-        同期パラメータ A
-    B : float
-        同期パラメータ B
-
-    Returns
-    -------
-    float
-        イベントカメラのタイムスタンプ [µs]
-    """
-    return (timestamp_ms - B) / A
-
-
-def get_event_frame_for_rgb_frame(
-    frame_index: int,
-    sync_log: pd.DataFrame,
-    A: float,
-    B: float,
-    events_path: str,
-    width: int,
-    height: int,
-    integration_time_ms: float,
-) -> np.ndarray:
-    """
-    指定した RGB フレームインデックスに対応するイベントフレームを生成する。
-
-    Parameters
-    ----------
-    frame_index : int
-        RGB フレームのインデックス
-    sync_log : pd.DataFrame
-        sync_log.csv を読み込んだ DataFrame（frame_index がインデックス）
-    A : float
-        同期パラメータ A
-    B : float
-        同期パラメータ B
-    events_path : str
-        events.csv のパス
-    width : int
-        出力フレームの幅 [pixels]
-    height : int
-        出力フレームの高さ [pixels]
-    integration_time_ms : float
-        積分時間 [ms]（この時間幅のイベントを収集）
-
-    Returns
-    -------
-    np.ndarray, shape (height, width, 3)
-        BGR イベントフレーム画像
-    """
-    if frame_index not in sync_log.index:
-        raise ValueError(f"frame_index={frame_index} は sync_log に存在しません。")
-
-    timestamp_ms = float(sync_log.loc[frame_index, "timestamp_ms"])
-    t_target_us = rgb_timestamp_to_event_timestamp(timestamp_ms, A, B)
-
-    # 積分時間の半分 [µs]
-    half_window_us = (integration_time_ms / 2.0) * 1000.0
-    t_start = t_target_us - half_window_us
-    t_end = t_target_us + half_window_us
-
-    events = load_events_in_range(events_path, t_start, t_end)
-    return build_event_frame(events, width, height)
-
-
 def get_3d_points_for_frame(
     landmark_df: pd.DataFrame,
     frame_index: int,
@@ -248,9 +136,9 @@ def get_3d_points_for_frame(
     landmark_df : pd.DataFrame
         landmark.csv の DataFrame
     frame_index : int
-        対象フレームインデックス
+        対象フレームインデックス（calibration_frame_index）
     landmark_ids : List[int]
-        対象ランドマーク ID のリスト（config.json の target_landmarks の id）
+        対象ランドマーク ID のリスト
 
     Returns
     -------
@@ -259,6 +147,7 @@ def get_3d_points_for_frame(
     """
     frame_df = landmark_df[landmark_df["frame_index"] == frame_index]
     if frame_df.empty:
+        print(f"  [警告] frame_index={frame_index} のデータが landmark.csv に存在しません。")
         return None
 
     rows = []
@@ -272,34 +161,122 @@ def get_3d_points_for_frame(
     return np.array(rows, dtype=np.float64)
 
 
+def get_all_3d_points_for_frame(
+    landmark_df: pd.DataFrame,
+    frame_index: int,
+) -> Tuple[np.ndarray, List[int]]:
+    """
+    指定フレームの全ランドマークの 3D 座標を取得する。（verify_reprojection 用に公開）
+
+    Parameters
+    ----------
+    landmark_df : pd.DataFrame
+        landmark.csv の DataFrame
+    frame_index : int
+        対象フレームインデックス
+
+    Returns
+    -------
+    Tuple[np.ndarray, List[int]]
+        (points_3d [N x 3], landmark_ids [N])
+    """
+    frame_df = landmark_df[landmark_df["frame_index"] == frame_index].copy()
+    frame_df = frame_df.sort_values("landmark_index")
+    if frame_df.empty:
+        return np.empty((0, 3), dtype=np.float64), []
+    points_3d = frame_df[["x_norm", "y_norm", "z_norm"]].values.astype(np.float64)
+    landmark_ids = frame_df["landmark_index"].tolist()
+    return points_3d, landmark_ids
+
+
+# ---------------------------------------------------------------------------
+# ヒートマップ生成
+# ---------------------------------------------------------------------------
+
+def build_annotation_heatmap(
+    events_path: str,
+    ef_cfg: Dict,
+    colormap: int = cv2.COLORMAP_INFERNO,
+) -> np.ndarray:
+    """
+    events.csv からアノテーション用のヒートマップ BGR 画像を生成する。
+
+    処理:
+        1. start_delay_us ～ +accumulation_time_us の範囲でイベントを空間積算
+        2. log1p 変換
+        3. clip_percentile パーセンタイルでクリッピング
+        4. 0-255 線形スケール → uint8 グレースケール
+        5. カラーマップを適用して BGR 画像として返す
+
+    Parameters
+    ----------
+    events_path : str
+        events.csv のパス
+    ef_cfg : Dict
+        config.json の "event_frame" セクション辞書
+    colormap : int
+        OpenCV カラーマップ定数（-1 でグレースケール）
+
+    Returns
+    -------
+    np.ndarray, shape (height, width, 3), dtype=uint8
+        BGR ヒートマップ画像
+    """
+    width = int(ef_cfg["width"])
+    height = int(ef_cfg["height"])
+    start_delay_us = float(ef_cfg["start_delay_us"])
+    accumulation_time_us = float(ef_cfg["accumulation_time_us"])
+    clip_percentile = float(ef_cfg.get("clip_percentile", 99.5))
+
+    print(
+        f"[ヒートマップ] start_delay={start_delay_us:.0f} µs, "
+        f"accumulation={accumulation_time_us:.0f} µs, "
+        f"clip_percentile={clip_percentile}%"
+    )
+
+    raw = build_event_heatmap(
+        filepath=events_path,
+        start_delay_us=start_delay_us,
+        accumulation_time_us=accumulation_time_us,
+        width=width,
+        height=height,
+    )
+    gray = normalize_to_uint8(raw, clip_percentile=clip_percentile)
+    bgr = heatmap_to_bgr(gray, colormap=colormap)
+    return bgr
+
+
 # ---------------------------------------------------------------------------
 # GUI アノテーター
 # ---------------------------------------------------------------------------
-class EventFrameAnnotator:
-    """
-    OpenCV GUI を使ってイベントフレーム上でランドマークを手動アノテーションするクラス。
 
-    ユーザーは config.json で指定された N 個のランドマーク（例: 7 点）を
-    順番にマウスクリックで指定する。
+class HeatmapAnnotator:
+    """
+    ヒートマップ画像上でランドマークを手動アノテーションし、PnP 問題を解くクラス。
+
+    旧実装との主な相違点:
+    - フレーム切り替え不要: ヒートマップは単一の積算画像（キャリブレーション期間全体）
+    - 3D 座標の取得元: config.json の calibration_frame_index で固定した RGB フレーム
+    - sync_params (A, B) の利用なし
 
     Attributes
     ----------
     config : Dict
         設定辞書
-    sync_log : pd.DataFrame
-        sync_log.csv の DataFrame
-    A, B : float
-        同期パラメータ
     landmark_df : pd.DataFrame
         landmark.csv の DataFrame
     camera_matrix : np.ndarray
-        イベントカメラの内部パラメータ行列 [3x3]
+        イベントカメラのカメラ行列 [3x3]
     dist_coeffs : np.ndarray
         イベントカメラの歪み係数 [5x1]
-    frame_indices : List[int]
-        利用可能な RGB フレームインデックスの一覧
+    calibration_frame_index : int
+        3D 座標取得に使用する RGB フレームインデックス
     target_landmarks : List[Dict]
         アノテーション対象のランドマーク定義リスト
+    heatmap_bgr : np.ndarray
+        生成済みのヒートマップ BGR 画像（キャッシュ）
+    clicked : List[Tuple[int, int]]
+        クリック済み座標リスト
     """
 
     def __init__(self, config: Dict, config_dir: Path):
@@ -313,16 +290,9 @@ class EventFrameAnnotator:
         """
         self.config = config
         self.config_dir = config_dir
-
-        paths = config["paths"]
         self._resolve = lambda p: str(config_dir / p)
 
-        # データ読み込み
-        print("[初期化] sync_log.csv を読み込み中...")
-        self.sync_log = load_sync_log(self._resolve(paths["sync_log"]))
-
-        print("[初期化] sync_params.json を読み込み中...")
-        self.A, self.B = load_sync_params(self._resolve(paths["sync_params"]))
+        paths = config["paths"]
 
         print("[初期化] landmark.csv を読み込み中...")
         self.landmark_df = load_landmark_csv(self._resolve(paths["landmark"]))
@@ -336,124 +306,106 @@ class EventFrameAnnotator:
         self.output_transform_path = self._resolve(paths["output_transform"])
         self.output_points_path = self._resolve(paths["output_points"])
 
-        ef_cfg = config["event_frame"]
-        self.width = int(ef_cfg["width"])
-        self.height = int(ef_cfg["height"])
-        self.integration_time_ms = float(ef_cfg["integration_time_ms"])
+        # calibration_frame_index: 3D 座標の取得元フレーム
+        self.calibration_frame_index = int(
+            config["rgb_frame"]["calibration_frame_index"]
+        )
+        print(
+            f"[初期化] calibration_frame_index = {self.calibration_frame_index} "
+            f"(3D 座標の取得元)"
+        )
+
+        self.ef_cfg = config["event_frame"]
+        self.width = int(self.ef_cfg["width"])
+        self.height = int(self.ef_cfg["height"])
 
         self.target_landmarks = config["target_landmarks"]
         self.n_points = len(self.target_landmarks)
 
-        # フレームインデックス一覧
-        self.frame_indices = sorted(self.sync_log.index.tolist())
-        self.current_frame_pos = 0  # frame_indices 内のポインタ
+        # クリック座標の保持リスト
+        self.clicked: List[Tuple[int, int]] = []
 
-        # アノテーション状態
-        # { frame_index: [(u, v), ...] } — フレームごとにクリック済み座標を保持
-        self.annotations: Dict[int, List[Tuple[int, int]]] = {}
+        # ヒートマップ（起動時に 1 度だけ生成）
+        self.heatmap_bgr: Optional[np.ndarray] = None
 
-        # イベントフレームキャッシュ（重複生成を防ぐ）
-        self._frame_cache: Dict[int, np.ndarray] = {}
+        # 再描画フラグ
+        self._need_redraw = True
 
         print("[初期化] 完了")
 
     # ------------------------------------------------------------------ #
-    # イベントフレーム取得
+    # ヒートマップ生成
     # ------------------------------------------------------------------ #
 
-    def _get_event_frame(self, frame_index: int) -> np.ndarray:
+    def _ensure_heatmap(self) -> None:
         """
-        指定フレームのイベントフレームをキャッシュ付きで取得する。
-
-        Parameters
-        ----------
-        frame_index : int
-            RGB フレームインデックス
-
-        Returns
-        -------
-        np.ndarray
-            BGR イベントフレーム画像
+        ヒートマップをまだ生成していない場合にのみ生成する（遅延初期化）。
         """
-        if frame_index not in self._frame_cache:
-            print(f"  [フレーム生成] frame_index={frame_index} ...")
-            frame = get_event_frame_for_rgb_frame(
-                frame_index=frame_index,
-                sync_log=self.sync_log,
-                A=self.A,
-                B=self.B,
-                events_path=self.events_path,
-                width=self.width,
-                height=self.height,
-                integration_time_ms=self.integration_time_ms,
-            )
-            self._frame_cache[frame_index] = frame
-        return self._frame_cache[frame_index].copy()
+        if self.heatmap_bgr is not None:
+            return
+        print("[ヒートマップ生成] events.csv を読み込み中（しばらくお待ちください）...")
+        self.heatmap_bgr = build_annotation_heatmap(
+            events_path=self.events_path,
+            ef_cfg=self.ef_cfg,
+            colormap=cv2.COLORMAP_INFERNO,
+        )
+        print(
+            f"[ヒートマップ生成] 完了: shape={self.heatmap_bgr.shape}, "
+            f"dtype={self.heatmap_bgr.dtype}"
+        )
 
     # ------------------------------------------------------------------ #
     # 描画
     # ------------------------------------------------------------------ #
 
-    def _draw_overlay(
-        self,
-        base: np.ndarray,
-        frame_index: int,
-        clicked: List[Tuple[int, int]],
-    ) -> np.ndarray:
+    def _draw_overlay(self) -> np.ndarray:
         """
-        イベントフレームにアノテーション用のオーバーレイを描画する。
-
-        Parameters
-        ----------
-        base : np.ndarray
-            描画対象のベース BGR 画像（コピーして使用）
-        frame_index : int
-            現在の RGB フレームインデックス
-        clicked : List[Tuple[int, int]]
-            現在クリック済みの座標リスト
+        ヒートマップにアノテーション用のオーバーレイを描画した表示用画像を返す。
 
         Returns
         -------
-        np.ndarray
-            オーバーレイ済み BGR 画像（表示倍率適用後）
+        np.ndarray, shape (height*DISPLAY_SCALE, width*DISPLAY_SCALE, 3)
+            表示倍率適用済みの BGR 画像
         """
-        img = base.copy()
+        img = self.heatmap_bgr.copy()
         h, w = img.shape[:2]
 
         # 記録済み点を描画
-        for i, (u, v) in enumerate(clicked):
+        for i, (u, v) in enumerate(self.clicked):
             name = self.target_landmarks[i]["name"]
             cv2.circle(img, (u, v), CLICK_RADIUS, CLICK_COLOR_DONE, -1)
-            cv2.putText(
-                img, name, (u + 8, v - 4),
-                FONT, 0.35, CLICK_COLOR_DONE, 1, cv2.LINE_AA
-            )
+            # 白のアウトライン付きテキストで視認性向上
+            cv2.putText(img, name, (u + 8, v - 4), FONT, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(img, name, (u + 8, v - 4), FONT, 0.35, CLICK_COLOR_DONE, 1, cv2.LINE_AA)
 
-        # 次にクリックすべきランドマーク名を上部に表示
-        n_done = len(clicked)
+        # ガイドテキスト
+        n_done = len(self.clicked)
         if n_done < self.n_points:
             next_lm = self.target_landmarks[n_done]
-            guide_text = f"[{n_done + 1}/{self.n_points}] Click: {next_lm['name']}"
+            guide_text = (
+                f"[{n_done + 1}/{self.n_points}] クリック: {next_lm['name']}"
+            )
+            guide_color = (0, 200, 255)
         else:
-            guide_text = "All points done! [s] Save / [r] Reset"
+            guide_text = "全点完了！ [s] で保存 / [r] でリセット"
+            guide_color = (0, 255, 128)
 
-        # フレーム情報
-        info_text = (
-            f"Frame: {frame_index} "
-            f"[n]next [p]prev [u]undo [r]reset [s]save [q]quit"
+        # 上部情報帯
+        calib_info = (
+            f"Heatmap  |  3D src: frame {self.calibration_frame_index}  |  "
+            f"[u]undo [r]reset [s]save [q]quit"
         )
-
-        # テキスト背景帯
-        cv2.rectangle(img, (0, 0), (w, 38), TEXT_BG_COLOR, -1)
-        cv2.putText(img, info_text, (4, 14), FONT, 0.38, TEXT_COLOR, 1, cv2.LINE_AA)
-        cv2.putText(img, guide_text, (4, 32), FONT, 0.42, (0, 200, 255), 1, cv2.LINE_AA)
+        cv2.rectangle(img, (0, 0), (w, 40), TEXT_BG_COLOR, -1)
+        cv2.putText(img, calib_info, (4, 14), FONT, 0.36, TEXT_COLOR, 1, cv2.LINE_AA)
+        cv2.putText(img, guide_text, (4, 33), FONT, 0.44, guide_color, 1, cv2.LINE_AA)
 
         # 表示倍率を適用
-        disp_w = w * DISPLAY_SCALE
-        disp_h = h * DISPLAY_SCALE
-        img = cv2.resize(img, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
-
-        return img
+        disp = cv2.resize(
+            img,
+            (w * DISPLAY_SCALE, h * DISPLAY_SCALE),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        return disp
 
     # ------------------------------------------------------------------ #
     # マウスコールバック
@@ -461,68 +413,63 @@ class EventFrameAnnotator:
 
     def _on_mouse(self, event, x, y, flags, param):
         """
-        マウスクリックイベントのコールバック。
-
-        左クリックで現在のターゲット座標を記録する。
-        表示倍率を考慮して元画像の座標に変換する。
+        マウス左クリックで現在のターゲット座標を記録する。
+        表示倍率の逆変換を行って元画像座標に変換する。
         """
         if event != cv2.EVENT_LBUTTONDOWN:
             return
 
-        # 表示倍率の逆変換
         orig_x = int(x / DISPLAY_SCALE)
         orig_y = int(y / DISPLAY_SCALE)
 
-        frame_index = self.frame_indices[self.current_frame_pos]
-        clicked = self.annotations.setdefault(frame_index, [])
-
-        if len(clicked) < self.n_points:
-            clicked.append((orig_x, orig_y))
-            name = self.target_landmarks[len(clicked) - 1]["name"]
-            print(f"  クリック [{len(clicked)}/{self.n_points}] {name}: ({orig_x}, {orig_y})")
+        if len(self.clicked) < self.n_points:
+            self.clicked.append((orig_x, orig_y))
+            name = self.target_landmarks[len(self.clicked) - 1]["name"]
+            print(
+                f"  クリック [{len(self.clicked)}/{self.n_points}] "
+                f"{name}: ({orig_x}, {orig_y})"
+            )
             self._need_redraw = True
 
     # ------------------------------------------------------------------ #
     # PnP 計算と保存
     # ------------------------------------------------------------------ #
 
-    def _solve_and_save(self, frame_index: int) -> bool:
+    def _solve_and_save(self) -> bool:
         """
-        指定フレームのアノテーションから PnP を解いて結果を保存する。
-
-        Parameters
-        ----------
-        frame_index : int
-            対象の RGB フレームインデックス
+        アノテーション済み 2D 点と calibration_frame_index の 3D 点から
+        PnP を解いて結果を JSON に保存する。
 
         Returns
         -------
         bool
             成功した場合 True
         """
-        clicked = self.annotations.get(frame_index, [])
-
-        if len(clicked) < self.n_points:
-            print(f"[エラー] アノテーションが {self.n_points} 点に満たないため PnP を実行できません。")
+        if len(self.clicked) < self.n_points:
+            print(
+                f"[エラー] アノテーションが {self.n_points} 点に満たないため "
+                f"PnP を実行できません。({len(self.clicked)} / {self.n_points} 点)"
+            )
             return False
 
-        # 2D 点（イベントフレーム座標）
-        points_2d = np.array(clicked[: self.n_points], dtype=np.float64)
+        # 2D 点（ヒートマップ上のピクセル座標）
+        points_2d = np.array(self.clicked[: self.n_points], dtype=np.float64)
 
-        # 3D 点（MediaPipe 正規化座標）
+        # 3D 点（calibration_frame_index の landmark.csv から取得）
         landmark_ids = [lm["id"] for lm in self.target_landmarks]
         points_3d = get_3d_points_for_frame(
-            self.landmark_df, frame_index, landmark_ids
+            self.landmark_df,
+            self.calibration_frame_index,
+            landmark_ids,
         )
-
         if points_3d is None:
             print("[エラー] landmark.csv から 3D 座標を取得できませんでした。")
             return False
 
-        print(f"[PnP] 2D 点:\n{points_2d}")
-        print(f"[PnP] 3D 点:\n{points_3d}")
+        print(f"[PnP] 2D 点 (ヒートマップ座標):\n{points_2d}")
+        print(f"[PnP] 3D 点 (MediaPipe 正規化座標, frame={self.calibration_frame_index}):\n{points_3d}")
         print(f"[PnP] カメラ行列:\n{self.camera_matrix}")
-        print(f"[PnP] 歪み係数:\n{self.dist_coeffs.ravel()}")
+        print(f"[PnP] 歪み係数: {self.dist_coeffs.ravel()}")
 
         # PnP 求解
         success, rvec, tvec = cv2.solvePnP(
@@ -540,39 +487,43 @@ class EventFrameAnnotator:
         print(f"[PnP 結果] rvec: {rvec.ravel()}")
         print(f"[PnP 結果] tvec: {tvec.ravel()}")
 
-        # 再投影誤差を計算して表示
+        # 再投影誤差
         projected_2d, _ = cv2.projectPoints(
             points_3d, rvec, tvec, self.camera_matrix, self.dist_coeffs
         )
         projected_2d = projected_2d.reshape(-1, 2)
         errors = np.linalg.norm(points_2d - projected_2d, axis=1)
-        print(f"[PnP] 再投影誤差 (px): {errors}")
+        print(f"[PnP] 各点の再投影誤差 [px]: {errors.round(2)}")
         print(f"[PnP] 平均再投影誤差: {errors.mean():.3f} px")
 
-        # 出力ディレクトリを作成
+        # 出力ディレクトリの作成
         Path(self.output_transform_path).parent.mkdir(parents=True, exist_ok=True)
         Path(self.output_points_path).parent.mkdir(parents=True, exist_ok=True)
 
-        # transform_matrix.json に保存
+        # transform_matrix.json の保存
         transform_data = {
-            "frame_index": frame_index,
+            "calibration_frame_index": self.calibration_frame_index,
             "rvec": rvec.ravel().tolist(),
             "tvec": tvec.ravel().tolist(),
             "reprojection_errors_px": errors.tolist(),
             "mean_reprojection_error_px": float(errors.mean()),
+            "heatmap_params": {
+                "start_delay_us": float(self.ef_cfg["start_delay_us"]),
+                "accumulation_time_us": float(self.ef_cfg["accumulation_time_us"]),
+                "clip_percentile": float(self.ef_cfg.get("clip_percentile", 99.5)),
+            },
         }
         with open(self.output_transform_path, "w", encoding="utf-8") as f:
             json.dump(transform_data, f, ensure_ascii=False, indent=2)
         print(f"[保存] {self.output_transform_path}")
 
-        # annotated_points.json に保存
-        landmark_names = [lm["name"] for lm in self.target_landmarks]
+        # annotated_points.json の保存
         points_data = {
-            "frame_index": frame_index,
+            "calibration_frame_index": self.calibration_frame_index,
             "landmarks": [
                 {
                     "id": self.target_landmarks[i]["id"],
-                    "name": landmark_names[i],
+                    "name": self.target_landmarks[i]["name"],
                     "point_2d": list(points_2d[i]),
                     "point_3d": list(points_3d[i]),
                     "reprojected_2d": list(projected_2d[i]),
@@ -591,83 +542,50 @@ class EventFrameAnnotator:
     # メインループ
     # ------------------------------------------------------------------ #
 
-    def run(self, initial_frame_index: Optional[int] = None):
+    def run(self) -> None:
         """
         GUI メインループを起動する。
 
-        Parameters
-        ----------
-        initial_frame_index : Optional[int]
-            起動時に表示する RGB フレームインデックス。
-            None の場合は最初のフレームから開始。
+        ヒートマップを生成してウィンドウに表示し、
+        ユーザーのキー操作・マウスクリックを処理する。
         """
-        if not self.frame_indices:
-            print("[エラー] 利用可能なフレームがありません。")
-            return
+        # ヒートマップ生成（大規模ファイルのため起動直後に実行）
+        self._ensure_heatmap()
 
-        # 初期フレーム位置を設定
-        if initial_frame_index is not None and initial_frame_index in self.frame_indices:
-            self.current_frame_pos = self.frame_indices.index(initial_frame_index)
-        else:
-            self.current_frame_pos = 0
-
-        # ウィンドウ作成
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
         cv2.setMouseCallback(WINDOW_NAME, self._on_mouse)
 
-        self._need_redraw = True
-
-        print("\n=== PnP Solver GUI 操作ガイド ===")
-        print("  n / →  : 次のフレームへ")
-        print("  p / ←  : 前のフレームへ")
-        print("  u      : 直前のクリックを取り消し (Undo)")
-        print("  r      : 現フレームのアノテーションをリセット")
-        print("  s      : PnP を計算して保存")
-        print("  q / Esc: 終了")
-        print("=================================\n")
+        print("\n=== PnP Solver (ヒートマップモード) 操作ガイド ===")
+        print("  マウス左クリック : ランドマークを順番に指定")
+        print("  u               : 直前のクリックを取り消し (Undo)")
+        print("  r               : アノテーションをリセット")
+        print("  s               : PnP を計算して output/ に保存")
+        print("  q / Esc         : 終了")
+        print(f"  3D 座標の取得元  : RGB frame {self.calibration_frame_index}")
+        print("=================================================\n")
 
         while True:
-            frame_index = self.frame_indices[self.current_frame_pos]
-
             if self._need_redraw:
-                base_frame = self._get_event_frame(frame_index)
-                clicked = self.annotations.get(frame_index, [])
-                display = self._draw_overlay(base_frame, frame_index, clicked)
+                display = self._draw_overlay()
                 cv2.imshow(WINDOW_NAME, display)
                 self._need_redraw = False
 
-            # キー入力待ち（30ms）
             key = cv2.waitKey(30) & 0xFF
 
             if key == 255:
-                # タイムアウト（入力なし）→ ループ継続
-                # ウィンドウが閉じられたか確認
-                if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                    print("[終了] ウィンドウが閉じられました。")
+                # タイムアウト → ウィンドウ閉じ確認
+                try:
+                    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                        print("[終了] ウィンドウが閉じられました。")
+                        break
+                except cv2.error:
                     break
                 continue
 
-            # n / → : 次フレーム
-            elif key in (ord("n"), 83):  # 83 = → (右矢印)
-                if self.current_frame_pos < len(self.frame_indices) - 1:
-                    self.current_frame_pos += 1
-                    self._need_redraw = True
-                else:
-                    print("[情報] 最後のフレームです。")
-
-            # p / ← : 前フレーム
-            elif key in (ord("p"), 81):  # 81 = ← (左矢印)
-                if self.current_frame_pos > 0:
-                    self.current_frame_pos -= 1
-                    self._need_redraw = True
-                else:
-                    print("[情報] 最初のフレームです。")
-
             # u : Undo
             elif key == ord("u"):
-                clicked = self.annotations.get(frame_index, [])
-                if clicked:
-                    removed = clicked.pop()
+                if self.clicked:
+                    removed = self.clicked.pop()
                     print(f"  [Undo] 削除: {removed}")
                     self._need_redraw = True
                 else:
@@ -675,13 +593,13 @@ class EventFrameAnnotator:
 
             # r : リセット
             elif key == ord("r"):
-                self.annotations[frame_index] = []
-                print(f"  [リセット] frame_index={frame_index} のアノテーションをリセットしました。")
+                self.clicked.clear()
+                print("  [リセット] アノテーションをリセットしました。")
                 self._need_redraw = True
 
             # s : 保存
             elif key == ord("s"):
-                if self._solve_and_save(frame_index):
+                if self._solve_and_save():
                     print("[成功] PnP 計算・保存が完了しました。")
                 else:
                     print("[失敗] PnP 計算に失敗しました。")
@@ -698,22 +616,21 @@ class EventFrameAnnotator:
 # ---------------------------------------------------------------------------
 # エントリーポイント
 # ---------------------------------------------------------------------------
-def main():
+
+def main() -> None:
     """メインエントリーポイント。コマンドライン引数を解析して GUI を起動する。"""
     parser = argparse.ArgumentParser(
-        description="PnP Solver: イベントフレーム上でランドマークをアノテーションし、変換行列を求解する。"
+        description=(
+            "PnP Solver (ヒートマップモード): "
+            "キャリブレーション期間のイベント蓄積ヒートマップ上でランドマークをアノテーションし、"
+            "変換行列を求解する。"
+        )
     )
     parser.add_argument(
         "--config",
         type=str,
         default="config.json",
         help="config.json のパス (デフォルト: config.json)",
-    )
-    parser.add_argument(
-        "--frame",
-        type=int,
-        default=None,
-        help="起動時に表示する RGB フレームインデックス (デフォルト: 最初のフレーム)",
     )
     args = parser.parse_args()
 
@@ -725,8 +642,8 @@ def main():
     config = load_config(str(config_path))
     config_dir = config_path.parent
 
-    annotator = EventFrameAnnotator(config, config_dir)
-    annotator.run(initial_frame_index=args.frame)
+    annotator = HeatmapAnnotator(config, config_dir)
+    annotator.run()
 
 
 if __name__ == "__main__":
