@@ -215,7 +215,7 @@ def project_and_draw(
         f"(PnP source: {source_frame_index})  "
         f"Projected: {n_proj} pts"
     )
-    info2 = "Red: projected  Green: annotated  [n]次 [p]前 [q]終了"
+    info2 = "Red: projected  Green: annotated  [n]next [p]prev [q]quit"
 
     cv2.rectangle(img, (0, 0), (w, 38), TEXT_BG_COLOR, -1)
     cv2.putText(img, info1, (4, 14), FONT, 0.38, TEXT_COLOR, 1, cv2.LINE_AA)

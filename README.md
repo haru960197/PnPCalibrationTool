@@ -122,7 +122,7 @@ python verify_reprojection.py --config config.json
   "landmarks": [
     {
       "id": 308,
-      "name": "口の左端",
+      "name": "Left of mouth",
       "point_2d": [u, v],
       "point_3d": [x, y, z],
       "reprojected_2d": [u', v'],

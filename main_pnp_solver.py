@@ -433,14 +433,14 @@ class EventFrameAnnotator:
         n_done = len(clicked)
         if n_done < self.n_points:
             next_lm = self.target_landmarks[n_done]
-            guide_text = f"[{n_done + 1}/{self.n_points}] クリック: {next_lm['name']}"
+            guide_text = f"[{n_done + 1}/{self.n_points}] Click: {next_lm['name']}"
         else:
-            guide_text = "全点完了! [s] で保存 / [r] でリセット"
+            guide_text = "All points done! [s] Save / [r] Reset"
 
         # フレーム情報
         info_text = (
-            f"Frame: {frame_index}  "
-            f"[n]次 [p]前 [u]undo [r]reset [s]save [q]quit"
+            f"Frame: {frame_index} "
+            f"[n]next [p]prev [u]undo [r]reset [s]save [q]quit"
         )
 
         # テキスト背景帯
